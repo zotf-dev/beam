@@ -31,7 +31,7 @@ import time
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
@@ -237,6 +237,154 @@ app.include_router(orchestrators.router)
 # Additional API Routes
 # =============================================================================
 
+
+
+
+@app.websocket("/ws/{worker_id}")
+async def worker_gateway_ws(websocket: WebSocket, worker_id: str):
+    """Local dedicated worker-gateway WebSocket endpoint.
+
+    Workers connect here when WORKER_GATEWAY_URL points at this orchestrator,
+    for example WORKER_GATEWAY_URL=http://127.0.0.1:8000.  This endpoint keeps
+    the worker socket in the orchestrator's local WorkerManager so the scheduler
+    can push task_offer messages to dedicated workers instead of relying on the
+    Beam-hosted public worker gateway.
+    """
+    await websocket.accept()
+
+    if orchestrator is None:
+        await websocket.close(code=1013, reason="orchestrator_not_ready")
+        return
+
+    # Ensure the local worker exists in the orchestrator cache.  Workers still
+    # self-register with BeamCore over HTTP; this local registration only makes
+    # the socket selectable by this orchestrator.
+    try:
+        if not orchestrator.get_worker(worker_id):
+            await orchestrator.register_worker(
+                hotkey=worker_id,
+                ip=websocket.client.host if websocket.client else "127.0.0.1",
+                port=websocket.client.port if websocket.client else 0,
+                region="local",
+                bandwidth_mbps=0.0,
+            )
+        orchestrator.register_worker_connection(worker_id, websocket)
+        logger.info("Dedicated worker connected: %s", worker_id)
+
+        await websocket.send_json({"type": "connected", "worker_id": worker_id})
+
+        while True:
+            message = await websocket.receive_json()
+            msg_type = message.get("type")
+
+            if msg_type == "stats_snapshot":
+                bandwidth_mbps = float(message.get("bandwidth_mbps") or 0.0)
+                active_tasks = int(message.get("tasks_active") or message.get("active_tasks") or 0)
+                bytes_delta = int(message.get("bytes_relayed_delta") or 0)
+                await orchestrator.apply_worker_stats_snapshot(
+                    worker_id, bandwidth_mbps, active_tasks, bytes_delta
+                )
+                await websocket.send_json({"type": "stats_snapshot_ack", "worker_id": worker_id})
+
+            elif msg_type == "task_accept":
+                task_id = message.get("task_id")
+                offer_id = message.get("offer_id") or task_id
+                accepted = True
+                reason = None
+                try:
+                    # For orchestrator-originated local offers, this enforces the
+                    # one-winner offer semantics.  For BeamCore-originated exact
+                    # chunk offers, there may be no local PendingOffer, so we still
+                    # ACK to keep the worker inside the 5s accept window.
+                    if offer_id and hasattr(orchestrator, "accept_task_offer"):
+                        ok, _chunk_data, _metadata = await orchestrator.accept_task_offer(
+                            offer_id, worker_id
+                        )
+                        if ok is not None:
+                            accepted = bool(ok) or offer_id == task_id
+                except Exception as exc:
+                    logger.debug("Local task_accept bookkeeping skipped: %s", exc)
+                await websocket.send_json(
+                    {
+                        "type": "task_accept_ack",
+                        "task_id": task_id,
+                        "offer_id": offer_id,
+                        "accepted": accepted,
+                        "reason": reason,
+                    }
+                )
+
+            elif msg_type == "task_reject":
+                offer_id = message.get("offer_id") or message.get("task_id")
+                reason = message.get("reason") or "rejected"
+                try:
+                    await orchestrator.reject_task_offer(offer_id, worker_id, reason)
+                except Exception:
+                    pass
+                await websocket.send_json(
+                    {
+                        "type": "task_accept_ack",
+                        "task_id": message.get("task_id"),
+                        "offer_id": offer_id,
+                        "accepted": False,
+                        "reason": reason,
+                    }
+                )
+
+            elif msg_type == "task_result_summary":
+                # Forward worker completion upstream over the orchestrator control
+                # websocket.  The worker submits PoB directly after receiving this
+                # ACK, matching the guide's Worker -> BeamCore evidence flow.
+                task_id = message.get("task_id")
+                offer_id = message.get("offer_id") or task_id
+                received = False
+                completed = False
+                reason = None
+                try:
+                    if orchestrator.subnet_core_client and orchestrator.subnet_core_client._ws:
+                        import json as _json
+
+                        upstream = dict(message)
+                        upstream.setdefault("worker_id", worker_id)
+                        await orchestrator.subnet_core_client._ws.send(_json.dumps(upstream))
+                        received = True
+                        completed = bool(message.get("success", False))
+                    else:
+                        reason = "orchestrator_ws_not_connected"
+                except Exception as exc:
+                    reason = str(exc)
+                    logger.warning("Failed to forward task_result_summary upstream: %s", exc)
+
+                await websocket.send_json(
+                    {
+                        "type": "task_result_summary_ack",
+                        "task_id": task_id,
+                        "offer_id": offer_id,
+                        "received": received,
+                        "completed": completed,
+                        "reason": reason,
+                    }
+                )
+
+            elif msg_type == "bw_challenge_response":
+                await websocket.send_json(
+                    {
+                        "type": "bw_challenge_ack",
+                        "challenge_id": message.get("challenge_id"),
+                        "worker_id": worker_id,
+                    }
+                )
+
+            else:
+                logger.debug("Unknown dedicated worker message from %s: %s", worker_id, msg_type)
+
+    except WebSocketDisconnect:
+        logger.info("Dedicated worker disconnected: %s", worker_id)
+    except Exception as exc:
+        logger.warning("Dedicated worker websocket error for %s: %s", worker_id, exc)
+    finally:
+        if orchestrator is not None:
+            orchestrator.unregister_worker_connection(worker_id)
 
 @app.get("/")
 async def root():

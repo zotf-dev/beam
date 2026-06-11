@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -793,24 +794,40 @@ class SubnetCoreClient:
                 logger.error(f"No WS connection for transfer_assigned {transfer_id}")
                 return
 
-            try:
-                response = await self._send_ws_request(
-                    {
-                        "type": "list_public_workers",
-                        "transfer_id": transfer_id,
-                        "request_id": f"workers:{request_id}",
-                    },
-                    timeout=hot_path_timeout,
+            use_local_gateway = os.environ.get("USE_LOCAL_WORKER_GATEWAY", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+            if use_local_gateway:
+                provider = getattr(self, "local_worker_provider", None)
+                workers = provider() if callable(provider) else []
+                logger.info(
+                    "Using %s locally connected dedicated worker(s) for assignment %s",
+                    len(workers),
+                    assignment_id,
                 )
-                workers = response.get("workers", [])
-            except Exception as e:
-                logger.error(
-                    "Failed to get worker list for transfer %s within %.1fs: %s",
-                    transfer_id,
-                    hot_path_timeout,
-                    e,
-                )
-                return
+            else:
+                try:
+                    response = await self._send_ws_request(
+                        {
+                            "type": "list_public_workers",
+                            "transfer_id": transfer_id,
+                            "request_id": f"workers:{request_id}",
+                        },
+                        timeout=hot_path_timeout,
+                    )
+                    workers = response.get("workers", [])
+                except Exception as e:
+                    logger.error(
+                        "Failed to get worker list for transfer %s within %.1fs: %s",
+                        transfer_id,
+                        hot_path_timeout,
+                        e,
+                    )
+                    return
 
             normalized_workers = _normalize_worker_list(workers, transfer_id)
             if not normalized_workers:
@@ -870,6 +887,30 @@ class SubnetCoreClient:
                     assignment_id,
                     len(worker_ids),
                 )
+
+                # Some gateway deployments include concrete task offers in the
+                # chunk_assignments acknowledgement.  In local dedicated-gateway
+                # mode, immediately push those offers to the connected worker
+                # sockets when present.  If the ack only contains task_count, the
+                # upstream BeamCore/gateway path remains responsible for delivery.
+                local_pusher = getattr(self, "local_task_offer_pusher", None)
+                if use_local_gateway and callable(local_pusher):
+                    offers = (
+                        response.get("task_offers")
+                        or response.get("offers")
+                        or response.get("tasks")
+                        or []
+                    )
+                    if offers:
+                        try:
+                            pushed = await local_pusher(offers)
+                            logger.info("Pushed %s BeamCore task offer(s) to local workers", pushed)
+                        except Exception as exc:
+                            logger.warning("Failed to push local task offers: %s", exc)
+                    else:
+                        logger.info(
+                            "chunk_assignments ack did not include task offers; awaiting upstream gateway delivery"
+                        )
                 return
             except Exception as e:
                 logger.error(

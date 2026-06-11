@@ -1339,6 +1339,46 @@ class Orchestrator:
             )
             self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
 
+            # Local dedicated worker gateway support.  When USE_LOCAL_WORKER_GATEWAY=true,
+            # SubnetCoreClient will prefer workers that are actually connected to this
+            # orchestrator's /ws/{worker_id} endpoint instead of selecting from the
+            # Beam-hosted public worker pool.
+            def _local_worker_provider():
+                records = []
+                for worker_id in list(self._worker_mgr.worker_connections.keys()):
+                    worker = self._worker_mgr.workers.get(worker_id)
+                    records.append(
+                        {
+                            "worker_id": worker_id,
+                            "bandwidth_mbps": float(getattr(worker, "bandwidth_mbps", 100.0) or 100.0),
+                            "trust_score": float(getattr(worker, "trust_score", 0.5) or 0.5),
+                            "active_tasks": int(getattr(worker, "active_tasks", 0) or 0),
+                            "source": "local_dedicated_gateway",
+                        }
+                    )
+                return records
+
+            self.subnet_core_client.local_worker_provider = _local_worker_provider
+
+            async def _local_task_offer_pusher(offers):
+                pushed = 0
+                for offer in offers:
+                    worker_id = offer.get("worker_id") or offer.get("assigned_worker_id")
+                    if not worker_id:
+                        assignment = offer.get("assignment") or {}
+                        worker_id = assignment.get("worker_id")
+                    websocket = self._worker_mgr.worker_connections.get(worker_id)
+                    if not websocket:
+                        continue
+                    payload = dict(offer)
+                    payload.setdefault("type", "task_offer")
+                    payload.setdefault("offer_id", payload.get("task_id"))
+                    await websocket.send_json(payload)
+                    pushed += 1
+                return pushed
+
+            self.subnet_core_client.local_task_offer_pusher = _local_task_offer_pusher
+
             # Configure registration message sent on every WS connect
             import socket as _socket
 
