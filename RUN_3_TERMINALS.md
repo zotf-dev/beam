@@ -41,3 +41,17 @@ export WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
 export WORKER_REQUIRED_PAYMENT=false
 python -m neurons.worker.worker --wallet.name <your_wallet> --wallet.hotkey <your_hotkey>
 ```
+
+cd /work/beam/neurons/orchestrator || exit 1
+export PYTHONPATH=/work/beam/neurons/orchestrator
+export READY=true
+export USE_LOCAL_WORKER_GATEWAY=true
+export WORKER_GATEWAY_PUBLIC_URL=http://127.0.0.1:8000
+python3 main.py
+
+
+cd /work/beam || exit 1
+export CORE_SERVER_URL=https://beamcore.b1m.ai
+export WORKER_GATEWAY_URL=http://127.0.0.1:8000
+export WORKER_REQUIRED_PAYMENT=false
+python3 -m neurons.worker.worker worker worker01
