@@ -781,6 +781,13 @@ class SubnetCoreClient:
 
         logger.info(f"transfer_assigned: transfer={transfer_id} chunks={chunk_start}-{chunk_end}")
 
+        # Guide requirement: after transfer_assigned the orchestrator has a tight
+        # assignment window (~5s). The original code used 30s waits and a retry
+        # loop here, which can miss BeamCore recovery windows. Keep this path
+        # single-shot and fast: list eligible workers, immediately send
+        # chunk_assignments, then let BeamCore recovery handle failures.
+        hot_path_timeout = min(4.0, max(1.0, float(self.timeout)))
+
         try:
             if not self._ws:
                 logger.error(f"No WS connection for transfer_assigned {transfer_id}")
@@ -791,13 +798,18 @@ class SubnetCoreClient:
                     {
                         "type": "list_public_workers",
                         "transfer_id": transfer_id,
-                        "request_id": request_id,
+                        "request_id": f"workers:{request_id}",
                     },
-                    timeout=max(30.0, float(self.timeout)),
+                    timeout=hot_path_timeout,
                 )
                 workers = response.get("workers", [])
             except Exception as e:
-                logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
+                logger.error(
+                    "Failed to get worker list for transfer %s within %.1fs: %s",
+                    transfer_id,
+                    hot_path_timeout,
+                    e,
+                )
                 return
 
             normalized_workers = _normalize_worker_list(workers, transfer_id)
@@ -806,73 +818,67 @@ class SubnetCoreClient:
                 return
 
             def worker_score(worker: dict[str, Any]) -> float:
-                trust = worker["trust_score"]
-                bandwidth = worker["bandwidth_mbps"]
-                return trust * min(2.0, bandwidth / 100.0)
+                trust = float(worker.get("trust_score") or 0.0)
+                bandwidth = float(worker.get("bandwidth_mbps") or 0.0)
+                active = float(worker.get("tasks_active") or worker.get("active_tasks") or 0.0)
+                load_penalty = 1.0 / (1.0 + active)
+                return trust * min(2.0, bandwidth / 100.0) * load_penalty
 
             sorted_workers = sorted(normalized_workers, key=worker_score, reverse=True)
-            worker_ids = [worker["worker_id"] for worker in sorted_workers]
+            worker_ids = [worker["worker_id"] for worker in sorted_workers if worker.get("worker_id")]
+            if not worker_ids:
+                logger.warning("Worker list for assignment %s had no usable worker_id values", assignment_id)
+                return
 
             assignments = [
                 {"chunk_index": i, "worker_id": worker_ids[i % len(worker_ids)]}
                 for i in range(chunk_start, chunk_end + 1)
             ]
 
-            max_attempts = 5
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    response = await self._send_ws_request(
-                        {
-                            "type": "chunk_assignments",
-                            "assignment_id": assignment_id,
-                            "assignments": assignments,
-                        },
-                        timeout=max(30.0, float(self.timeout)),
-                    )
-                    task_count = int(response.get("task_count") or 0)
-                    if response.get("type") != "chunks_queued":
-                        raise RuntimeError(f"unexpected chunk assignment ack: {response}")
-                    if task_count <= 0:
-                        logger.warning(
-                            "Chunk assignment ack reported zero newly queued tasks for "
-                            "assignment %s; tasks may already be active from an earlier submit",
-                            assignment_id,
-                        )
-                    elif task_count < len(assignments):
-                        logger.warning(
-                            "Chunk assignment ack queued fewer tasks than chunks: "
-                            "assignment=%s chunks=%s tasks=%s",
-                            assignment_id,
-                            len(assignments),
-                            task_count,
-                        )
-                    logger.info(
-                        "Queued %s worker tasks from %s chunk_assignments for assignment %s",
-                        task_count,
-                        len(assignments),
-                        assignment_id,
-                    )
-                    return
-                except Exception as e:
-                    if attempt >= max_attempts:
-                        logger.error(
-                            "Failed to queue chunk_assignments for assignment %s after %s attempts: %s",
-                            assignment_id,
-                            max_attempts,
-                            e,
-                        )
-                        return
-                    delay = min(30.0, 2.0 * attempt)
+            try:
+                response = await self._send_ws_request(
+                    {
+                        "type": "chunk_assignments",
+                        "assignment_id": assignment_id,
+                        "transfer_id": transfer_id,
+                        "assignments": assignments,
+                        "request_id": f"chunks:{request_id}",
+                    },
+                    timeout=hot_path_timeout,
+                )
+                task_count = int(response.get("task_count") or 0)
+                if response.get("type") != "chunks_queued":
+                    raise RuntimeError(f"unexpected chunk assignment ack: {response}")
+                if task_count <= 0:
                     logger.warning(
-                        "Failed to queue chunk_assignments for assignment %s "
-                        "(attempt %s/%s): %s; retrying in %.1fs",
+                        "Chunk assignment ack reported zero newly queued tasks for "
+                        "assignment %s; tasks may already be active from an earlier submit",
                         assignment_id,
-                        attempt,
-                        max_attempts,
-                        e,
-                        delay,
                     )
-                    await asyncio.sleep(delay)
+                elif task_count < len(assignments):
+                    logger.warning(
+                        "Chunk assignment ack queued fewer tasks than chunks: "
+                        "assignment=%s chunks=%s tasks=%s",
+                        assignment_id,
+                        len(assignments),
+                        task_count,
+                    )
+                logger.info(
+                    "Queued %s worker tasks from %s chunk_assignments for assignment %s using %s worker(s)",
+                    task_count,
+                    len(assignments),
+                    assignment_id,
+                    len(worker_ids),
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    "Failed to queue chunk_assignments for assignment %s within %.1fs: %s",
+                    assignment_id,
+                    hot_path_timeout,
+                    e,
+                )
+                return
         except Exception:
             logger.exception(
                 "Failed to process transfer_assigned for transfer %s assignment %s",

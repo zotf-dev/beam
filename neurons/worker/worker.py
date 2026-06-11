@@ -104,7 +104,7 @@ SEND_TIMEOUT = 30  # seconds
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
 FETCH_STREAM_CHUNK_SIZE = 64 * 1024
-WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
+WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "5.0"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -115,7 +115,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", True)
+WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", False)
 
 # Global semaphore for task concurrency
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
