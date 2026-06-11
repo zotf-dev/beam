@@ -1602,16 +1602,58 @@ async def run_worker(state: WorkerState):
     print("[Worker] Stopped")
 
 
+def _argv_value(flag: str, default=None):
+    """Read CLI arguments manually."""
+
+    # --wallet.name worker
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+
+    # --wallet.name=worker
+    prefix = flag + "="
+    for arg in sys.argv:
+        if arg.startswith(prefix):
+            return arg.split("=", 1)[1]
+
+    return default
+
+
 def get_config():
     """Get configuration from command line arguments."""
+
     parser = argparse.ArgumentParser(description="Beam Network Worker")
 
-    # Bittensor wallet arguments
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
 
-    # Parse arguments
     config = bt.Config(parser)
+
+    # Force wallet values from argv
+    wallet_name = _argv_value("--wallet.name")
+    hotkey_name = _argv_value("--wallet.hotkey")
+
+    # Optional positional support:
+    # python -m neurons.worker.worker worker worker01
+    if wallet_name is None and len(sys.argv) > 1:
+        if not sys.argv[1].startswith("-"):
+            wallet_name = sys.argv[1]
+
+    if hotkey_name is None and len(sys.argv) > 2:
+        if not sys.argv[2].startswith("-"):
+            hotkey_name = sys.argv[2]
+
+    if wallet_name:
+        config.wallet.name = wallet_name
+
+    if hotkey_name:
+        config.wallet.hotkey = hotkey_name
+
+    bt.logging.info(
+        f"Using wallet={config.wallet.name}, hotkey={config.wallet.hotkey}"
+    )
+
     return config
 
 
